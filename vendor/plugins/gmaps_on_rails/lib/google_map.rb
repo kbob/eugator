@@ -154,6 +154,12 @@ class GoogleMap
     if self.zoom
       zoom_js = zoom
     else
+      if self.markers.size == 1
+        min_lat -= 0.001;  # degrees
+        min_lng -= 0.001;
+        max_lat += 0.001;
+        max_lng += 0.001;
+      end
       bounds_js = "new GLatLngBounds(new GLatLng(#{min_lat}, #{min_lng}), new GLatLng(#{max_lat}, #{max_lng}))"
       zoom_js = "#{dom_id}.getBoundsZoomLevel(#{bounds_js})"
     end
