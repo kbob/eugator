@@ -1,5 +1,5 @@
 # == Schema Information
-# Schema version: 20080705164959
+# Schema version: 20110604174521
 #
 # Table name: events
 #
@@ -7,20 +7,23 @@
 #  title           :string(255)
 #  description     :text
 #  start_time      :datetime
-#  venue_id        :integer
 #  url             :string(255)
 #  created_at      :datetime
 #  updated_at      :datetime
+#  venue_id        :integer
 #  source_id       :integer
 #  duplicate_of_id :integer
 #  end_time        :datetime
+#  version         :integer
+#  rrule           :string(255)
+#  venue_details   :text
 #
 
 # == Event
 #
 # A model representing a calendar event.
 class Event < ActiveRecord::Base
-  Tag # this class uses tagging. referencing the Tag class ensures that has_many_polymorphs initializes correctly across reloads.
+  include SearchEngine
 
   # Treat any event with a duration of at least this many hours as a multiday
   # event. This constant is used by the #multiday? method and is primarily
@@ -28,29 +31,14 @@ class Event < ActiveRecord::Base
   # days, rather than hours.
   MIN_MULTIDAY_DURATION = 20.hours
 
-  # Names of columns and methods to create Solr indexes for
-  INDEXABLE_FIELDS = \
-    %w(
-      title
-      description
-      url
-      duplicate_for_solr
-      start_time_for_solr
-      end_time_for_solr
-      event_title_for_solr
-      venue_title_for_solr
-      text_for_solr
-      tag_list
-    ).map(&:to_sym)
-
-  unless RAILS_ENV == 'test'
-    acts_as_solr :fields => INDEXABLE_FIELDS
-  end
-  
   has_paper_trail
+  acts_as_taggable
+
+  xss_foliate :strip => [:title], :sanitize => [:description, :venue_details]
+  include DecodeHtmlEntitiesHack
 
   # Associations
-  belongs_to :venue
+  belongs_to :venue, :counter_cache => true
   belongs_to :source
 
   # Triggers
@@ -67,30 +55,58 @@ class Event < ActiveRecord::Base
   include ValidatesBlacklistOnMixin
   validates_blacklist_on :title, :description, :url
 
+  include UpdateUpdatedAtMixin
+
   include VersionDiff
 
   # Duplicates
   include DuplicateChecking
-  duplicate_checking_ignores_attributes    :source_id, :version
-  duplicate_squashing_ignores_associations :tags
+  duplicate_checking_ignores_attributes    :source_id, :version, :venue_id
+  duplicate_squashing_ignores_associations :tags, :base_tags, :taggings
 
   # Named scopes
-  named_scope :masters,
-    :conditions => ["events.duplicate_of_id IS NULL"],
-    :include => [:source, :venue, :tags, :taggings]
+  scope :on_or_after_date, lambda { |date|
+    time = date.beginning_of_day
+    where("(start_time >= :time) OR (end_time IS NOT NULL AND end_time > :time)",
+      :time => time).order(:start_time)
+  }
+  scope :before_date, lambda { |date|
+    time = date.beginning_of_day
+    where("start_time < :time", :time => time).order(:start_time)
+  }
+  scope :future, lambda { on_or_after_date(Time.zone.today) }
+  scope :past, lambda { before_date(Time.zone.today) }
+  scope :within_dates, lambda { |start_date, end_date|
+    if start_date == end_date
+      end_date = end_date + 1.day
+    end
+    on_or_after_date(start_date).before_date(end_date)
+  }
+
+  # Expand the simple sort order names from the URL into more intelligent SQL order strings
+  scope :ordered_by_ui_field, lambda{|ui_field|
+    case ui_field
+      when 'name'
+        order('lower(events.title), start_time')
+      when 'venue'
+        includes(:venue).order('lower(venues.title), start_time')
+      else # when 'date', nil
+        order('start_time')
+    end
+  }
 
   #---[ Overrides ]-------------------------------------------------------
 
   # Return the title but strip out any whitespace.
   def title
     # TODO Generalize this code so we can use it on other attributes in the different model classes. The solution should use an #alias_method_chain to make sure it's not breaking any explicit overrides for an attribute.
-    return read_attribute(:title).ergo.strip
+    return read_attribute(:title).to_s.strip
   end
 
   # Return description without those pesky carriage-returns.
   def description
     # TODO Generalize this code so we can reuse it on other attributes.
-    return read_attribute(:description).ergo{self.gsub("\r\n", "\n").gsub("\r", "\n")}
+    return read_attribute(:description).to_s.gsub("\r\n", "\n").gsub("\r", "\n")
   end
 
   if (table_exists? rescue nil)
@@ -112,34 +128,45 @@ class Event < ActiveRecord::Base
     alias_method_chain :end_time=, :smarter_setter
   end
 
-  # Set the time in Event +record+ instance for an +attribute+ (e.g.,
-  # :start_time) to +value+ (e.g., a Time).
+  # Sets record's attribute to time value. If time is invalid, marks record as invalid.
+  #
+  # @param [ActiveRecord::Base] record The record to modify.
+  # @param [String, Symbol] attribute The attribute to set, e.g. :start_time.
+  # @param [Time] value The time.
+  #
+  # @return [Time]
   def self.set_time_on(record, attribute, value)
-    result = self.time_for(value)
-    case result
-    when Exception
+    begin
+      result = self.time_for(value)
+    rescue Exception => e
       record.errors.add(attribute, "is invalid")
       return record.send("#{attribute}_without_smarter_setter=", nil)
-    else
-      return record.send("#{attribute}_without_smarter_setter=", result)
     end
+    return record.send("#{attribute}_without_smarter_setter=", result)
   end
 
-  # Return the time for the +value+, which could be a Time, Date, DateTime,
-  # String, Array of Strings, etc.
+  # Returns time for the value, which can be a Time, Date, DateTime, String,
+  # Array of Strings, nil, etc.
+  #
+  # @param [nil, String, Date, DateTime, ActiveSupport::TimeWithZone, Time] value The time to parse.
+  #
+  # @return [Time]
+  #
+  # @raise TypeError Thrown if given an unknown type.
+  # @raise Exception Thrown if value can't be parsed.
   def self.time_for(value)
     value = value.join(' ') if value.kind_of?(Array)
     case value
     when NilClass
       return nil
     when String
-      return nil if value.blank?
-      begin
-        return Time.parse(value)
-      rescue Exception => e
-        return e
-      end
-    when Date, Time, DateTime, ActiveSupport::TimeWithZone
+      # This can throw an exception
+      return value.present? ?
+        Time.zone.parse(value) :
+        nil
+    when Date, DateTime, ActiveSupport::TimeWithZone
+      return value.to_time
+    when Time
       return value # Accept as-is.
     else
       raise TypeError, "Unknown type #{value.class.to_s.inspect} with value #{value.inspect}"
@@ -180,7 +207,7 @@ class Event < ActiveRecord::Base
   #     :more => ...,       # First event after the two week window or nil
   #   }
   def self.select_for_overview
-    today = Time.today
+    today = Time.zone.now.beginning_of_day
     tomorrow = today + 1.day
     after_tomorrow = tomorrow + 1.day
     future_cutoff = today + 2.weeks
@@ -194,7 +221,7 @@ class Event < ActiveRecord::Base
 
     # Find all events between today and future_cutoff, sorted by start_time
     # includes events any part of which occurs on or after today through on or after future_cutoff
-    overview_events = Event.find_by_dates(today.utc, future_cutoff, :order => :start_time)
+    overview_events = self.non_duplicates.within_dates(today, future_cutoff)
     overview_events.each do |event|
       if event.start_time < tomorrow
         times_to_events[:today]    << event
@@ -211,60 +238,11 @@ class Event < ActiveRecord::Base
     return times_to_events
   end
 
-  # last Time representable in certain operating systems is Jan 18 2038, local time
-  # TODO rewrite SQL in find_by_dates to eliminate the need for this constant
-  #   also re-write call find_future_events
-  #   see r1048 which has been reverted because it broke find_future_events
-  END_OF_TIME = Time.local(2038, 01, 18).yesterday.end_of_day.utc
-
-  # Returns an Array of non-duplicate future Event instances.
-  # where "future" means any part of an event occurs today or later
-  # Options:
-  # * :order => How to sort events. Defaults to :start_time.
-  # * :venue => Which venue to display events for. Defaults to all
-  def self.find_future_events(opts={})
-    order = opts[:order] || :start_time
-    venue = opts[:venue]
-    Event.find_by_dates(Time.today.utc, END_OF_TIME, :order => order, :venue => venue)
-  end
-
-  # Returns an Array of non-duplicate Event instances in a date range
-  # includes event if any part of the event is (on or after the start) and (on or before the end)
-  # Options:
-  # * :order => How to sort events. Defaults to :start_time.
-  # * :venue => Which venue to display events for. Defaults to all.
-  def self.find_by_dates(start_of_range, end_of_range, opts={})
-    start_of_range = Time.parse(start_of_range.to_s) if start_of_range.is_a?(Date)
-    end_of_range = Time.parse(end_of_range.to_s).end_of_day if end_of_range.is_a?(Date)
-    order = opts [:order] || :start_time
-
-    # event is in range if start_time is in range
-    # an event with an end_time is out of range if
-    #  its start_time is after the end of range OR its end_time is before the start of the range
-    conditions_sql = <<-HERE
-      ( (start_time >= :start_of_range AND start_time <= :end_of_range) OR
-        (end_time IS NOT NULL AND
-          NOT (start_time > :end_of_range OR end_time < :start_of_range ) ) )
-    HERE
-
-    conditions_vars = {
-      :start_of_range => start_of_range.utc,
-      :end_of_range => end_of_range.utc }
-
-    if venue = opts[:venue]
-      conditions_sql << " AND venues.id = :venue"
-      conditions_vars[:venue] = venue.id
-    end
-
-    return self.masters.find(:all,
-      :conditions => [conditions_sql, conditions_vars],
-      :order => order)
-  end
-
   # Return Hash of Events grouped by the +type+.
-  def self.find_duplicates_by_type(type='title')
-    if type == 'na'
-      return { [] => self.find_future_events }
+  def self.find_duplicates_by_type(type='na')
+    case type.to_s.strip
+    when 'na', ''
+      return { [] => self.future }
     else
       kind = %w[all any].include?(type) ? type.to_sym : type.split(',')
       return self.find_duplicates_by(kind,
@@ -273,121 +251,69 @@ class Event < ActiveRecord::Base
     end
   end
 
-  #---[ Solr searching ]--------------------------------------------------
+  #---[ Sort labels ]-------------------------------------------
 
-  # Number of records to index at once.
-  SOLR_REBUILD_BATCH_SIZE = 100
+  # Labels displayed for sorting options:
+  SORTING_LABELS = {
+    'name'  => 'Event Name',
+    'venue' => 'Location',
+    'score' => 'Relevance',
+    'date'  => 'Date',
+  }
 
-  # Index only specific events with Solr.
-  def self.rebuild_solr_index(batch_size=SOLR_REBUILD_BATCH_SIZE)
-    timer = Time.now
-    super(batch_size){|klass, opts| self.masters.find(:all, opts)}
-    elapsed = Time.now - timer
-    logger.debug(self.count>0 ? "Index for #{self.name} rebuilt in #{elapsed}s" : "Nothing to index for #{self.name}")
-    return elapsed
-  end
-
-  # How similar should terms be to qualify as a match? This value should be
-  # close to zero because Lucene's implementation of fuzzy matching is
-  # defective, e.g., at 0.5 it can't even realize that "meetin" is similar to
-  # "meeting".
-  SOLR_SIMILARITY = 0.3
-
-  # How much to boost the score of a match in the title?
-  SOLR_TITLE_BOOST = 4
-
-  # Number of search matches to return by default.
-  SOLR_SEARCH_MATCHES = 50
-
-  # Default search sort order
-  DEFAULT_SEARCH_ORDER = :score
-
-  # Return an Array of non-duplicate Event instances matching the search +query+..
-  #
-  # Options:
-  # * :order => How to order the entries? Defaults to :score. Permitted values:
-  #   * :score => Sort with most relevant matches first
-  #   * :date => Sort by date
-  #   * :name => Sort by event title
-  #   * :title => same as :name
-  #   * :venue => Sort by venue title
-  # * :limit => Maximum number of entries to return. Defaults to SOLR_SEARCH_MATCHES.
-  # * :skip_old => Return old entries? Defaults to false.
-  def self.search(query, opts={})
-    skip_old = opts[:skip_old] == true
-    limit = opts[:limit] || SOLR_SEARCH_MATCHES
-    order = opts[:order].ergo.to_sym || DEFAULT_SEARCH_ORDER
-
-    formatted_query = \
-      %{NOT duplicate_for_solr:"1" AND (} \
-      << query \
-      .downcase \
-      .gsub(/:/, '?') \
-      .scan(/\S+/) \
-      .map(&:escape_lucene) \
-      .map{|term| %{
-        title:"#{term}"~#{SOLR_SIMILARITY}^#{SOLR_TITLE_BOOST}
-        OR tag:"#{term}"~#{SOLR_SIMILARITY}^#{SOLR_TITLE_BOOST}
-        OR "#{term}"~#{SOLR_SIMILARITY}}
-      } \
-      .join(' ') \
-      .gsub(/^\s{2,}|\s{2,}$|\s{2,}/m, ' ') \
-      << ')'
-
-    if skip_old
-      formatted_query << %{ AND (start_time_for_solr:[#{Time.today.yesterday.strftime(SOLR_TIME_FORMAT)} TO #{SOLR_TIME_MAXIMUM}])}
+  # Return the label for the +sorting_key+ (e.g. 'score'). Optionally set the
+  # +is_searching_by_tag+, to constrain options available for tag searches.
+  def self.sorting_label_for(sorting_key=nil, is_searching_by_tag=false)
+    sorting_key = sorting_key.to_s
+    if sorting_key.present? and SORTING_LABELS.has_key?(sorting_key)
+      SORTING_LABELS[sorting_key]
+    elsif is_searching_by_tag
+      SORTING_LABELS['date']
+    else
+      SORTING_LABELS['score']
     end
-
-    solr_opts = {
-      :order => "score desc",
-      :limit => limit,
-      :scores => true,
-    }
-    events_by_score = self.find_with_solr(formatted_query, solr_opts)
-    events = \
-      case order
-      when :score        then events_by_score
-      when :name, :title then events_by_score.sort_by(&:event_title_for_solr)
-      when :venue        then events_by_score.sort_by(&:venue_title_for_solr)
-      when :date         then events_by_score.sort_by(&:start_time_for_solr)
-      else raise ArgumentError, "Unknown order: #{order}"
-      end
-    return events
   end
 
-  # Return an array of events found via Solr for the +formatted_query+ string
-  # and +solr_opts+ hash. The primary benefit of this method is that it makes
-  # it very easy to stub in specs.
-  def self.find_with_solr(formatted_query, solr_opts={})
-    return self.find_by_solr(formatted_query, solr_opts).results
-  end
+  #---[ Searching ]-------------------------------------------------------
 
-  # Return events matching given +tag+ grouped by their currentness, see
-  # ::group_by_currentness for data structure details.
+  # NOTE: The `Event.search` method is implemented elsewhere! For example, it's
+  # added by SearchEngine::ActsAsSolr if you're using that search engine.
+
+  # Return events matching the given +tag+ are grouped by their currentness,
+  # see ::group_by_currentness for data structure details.
+  #
+  # Will also set :error key if there was a non-fatal problem, e.g. invalid
+  # sort order.
   #
   # Options:
   # * :current => Limit results to only current events? Defaults to false.
   def self.search_tag_grouped_by_currentness(tag, opts={})
+    error = nil
+    tagged_with_opts = {}
     case opts[:order]
-      when 'name', 'title'
-        opts[:order] = 'events.title'
-      when 'date'
-        opts[:order] = 'events.start_time'
-      when 'venue'
-        opts[:order] = 'venues.title'
-        opts[:include] = :venue
+    when 'date', '', nil
+      tagged_with_opts[:order] = 'events.start_time'
+    when 'name', 'title'
+      tagged_with_opts[:order] = 'events.title'
+    when 'venue'
+      tagged_with_opts[:order] = 'venues.title'
+      tagged_with_opts[:include] = :venue
+    else
+      tagged_with_opts[:order] = 'events.start_time'
+      error = "Unknown ordering option #{opts[:order].inspect}, sorting by date instead."
     end
 
-    result = self.group_by_currentness(self.tagged_with(tag, opts))
+    result = self.group_by_currentness(self.includes(:venue).tagged_with(tag, tagged_with_opts))
     # TODO Avoid searching for :past results. Currently finding them and discarding them when not wanted.
     result[:past] = [] if opts[:current]
+    result[:error] = error
     return result
   end
 
   # Return events grouped by their currentness. Accepts the same +args+ as
   # #search. The results hash is keyed by whether the event is current
   # (true/false) and the values are arrays of events.
-  def self.search_grouped_by_currentness(query, opts={})
+  def self.search_keywords_grouped_by_currentness(query, opts={})
     events = self.group_by_currentness(self.search(query, opts))
     if events[:past] && opts[:order].to_s == "date"
       events[:past].reverse!
@@ -397,53 +323,13 @@ class Event < ActiveRecord::Base
 
   # Return +events+ grouped by currentness using a data structure like:
   #
-  #   { 
+  #   {
   #     :current => [ my_current_event, my_other_current_event ],
   #     :past => [ my_past_event ],
   #   }
   def self.group_by_currentness(events)
     grouped = events.group_by(&:current?)
     return {:current => grouped[true] || [], :past => grouped[false] || []}
-  end
-
-  #---[ Solr helpers ]----------------------------------------------------
-
-  # Format to use for storing Solr dates. Must generate a number that can be meaningfully sorted by value.
-  SOLR_TIME_FORMAT = '%Y%m%d%H%M'
-
-  # Maximum length of a SOLR_TIME_FORMAT string.
-  SOLR_TIME_LENGTH = Time.now.strftime(SOLR_TIME_FORMAT).length
-
-  # Maximum numeric date for a Solr date string.
-  SOLR_TIME_MAXIMUM = ('9' * SOLR_TIME_LENGTH).to_i
-
-  # Return a purely numeric representation of the start_time
-  def start_time_for_solr
-    self.start_time.ergo{utc.strftime(SOLR_TIME_FORMAT).to_i} || ""
-  end
-
-  # Return a purely numeric representation of the end_time
-  def end_time_for_solr
-    self.end_time.ergo{utc.strftime(SOLR_TIME_FORMAT).to_i} || ""
-  end
-
-  # Returns value for whether the record is a duplicate or not
-  def duplicate_for_solr
-    self.duplicate_of_id.blank? ? 0 : 1
-  end
-
-  def event_title_for_solr
-    self.title.to_s.downcase
-  end
-
-  def venue_title_for_solr
-    self.venue.ergo.title.to_s.downcase
-  end
-
-  # Return a string containing the text of all the indexable fields joined together.
-  def text_for_solr
-    # NOTE: The #text_for_solr method is one of the INDEXABLE_FIELDS, so don't indexing it to avoid an infinite loop. Some fields are methods, not database columns, so use #send rather than read_attribute.
-    (INDEXABLE_FIELDS - [:text_for_solr]).map{|name| self.send(name).to_s.downcase}.join("|").to_s
   end
 
   #---[ Transformations ]-------------------------------------------------
@@ -455,7 +341,7 @@ class Event < ActiveRecord::Base
     event.source       = source
     event.title        = abstract_event.title
     event.description  = abstract_event.description
-    event.start_time   = Time.parse(abstract_event.start_time.to_s)
+    event.start_time   = abstract_event.start_time.blank? ? nil : Time.parse(abstract_event.start_time.to_s)
     event.end_time     = abstract_event.end_time.blank? ? nil : Time.parse(abstract_event.end_time.to_s)
     event.url          = abstract_event.url
     event.venue        = Venue.from_abstract_location(abstract_event.location, source) if abstract_event.location
@@ -501,24 +387,26 @@ EOF
   #   ics2 = Event.to_ical(myevents, :url_helper => lambda{|event| event_url(event)})
   def self.to_ical(events, opts={})
     events = [events].flatten
-    
+
     icalendar = RiCal.Calendar do |calendar|
+      calendar.prodid = "-//Calagator//EN"
       for item in events
         calendar.event do |entry|
           entry.summary(item.title || 'Untitled Event')
-          
-          desc = returning String.new do |d|
+
+          desc = String.new.tap do |d|
             if item.multiday?
               d << "This event runs from #{TimeRange.new(item.start_time, item.end_time, :format => :text).to_s}."
               d << "\n\n Description:\n"
             end
 
-            d << Hpricot(item.description).to_plain_text unless item.description.blank?
-            d << "\n\nTags:\n#{item.tag_list}" unless item.tag_list.blank?
+            d << Loofah::Helpers::strip_tags(item.description) if item.description.present?
+            d << "\n\nTags: #{item.tag_list}" unless item.tag_list.blank?
+            d << "\n\nImported from: #{opts[:url_helper].call(item)}" if opts[:url_helper]
           end
-          
+
           entry.description(desc) unless desc.blank?
-          
+
           entry.created       item.created_at if item.created_at
           entry.last_modified item.updated_at if item.updated_at
 
@@ -528,7 +416,7 @@ EOF
           # file and set the "icalendar_sequence_offset" value to something
           # greater than 0.
           entry.sequence((SECRETS.icalendar_sequence_offset || 0) + item.versions.count)
-          
+
           if item.multiday?
             entry.dtstart item.dates.first
             entry.dtend   item.dates.last + 1.day
@@ -537,16 +425,14 @@ EOF
             entry.dtend   item.end_time || item.start_time + 1.hour
           end
 
-          # The reason for this messy URL helper business is that models can't access the route helpers,
-          # and even if they could, they'd need to access the request object so they know what the server's name is and such.
-          if item.url.blank?
-            entry.url opts[:url_helper].call(item) if opts[:url_helper]
-          else
+          if item.url.present?
             entry.url item.url
           end
 
-          entry.location item.venue.title if item.venue
-          
+          if item.venue
+            entry.location [item.venue.title, item.venue.full_address].compact.join(": ")
+          end
+
           # dtstamp and uid added because of a bug in Outlook;
           # Outlook 2003 will not import an .ics file unless it has DTSTAMP, UID, and METHOD
           # use created_at for DTSTAMP; if there's no created_at, use event.start_time;
@@ -555,11 +441,11 @@ EOF
         end
       end
     end
-    
+
     # Add the calendar name, normalize line-endings to UNIX LF, then replace them with DOS CF-LF.
     return icalendar.
       export.
-      sub(/CALSCALE:Gregorian/, "CALSCALE:Gregorian\nX-WR-CALNAME:#{SETTINGS.name}\nMETHOD:PUBLISH").
+      sub(/(CALSCALE:\w+)/i, "\\1\nX-WR-CALNAME:#{SETTINGS.name}\nMETHOD:PUBLISH").
       gsub(/\r\n/,"\n").
       gsub(/\n/,"\r\n")
   end
@@ -575,7 +461,7 @@ EOF
   end
 
   # Array of attributes that should be cloned by #to_clone.
-  CLONE_ATTRIBUTES = [:title, :description, :venue_id, :url, :tag_list]
+  CLONE_ATTRIBUTES = [:title, :description, :venue_id, :url, :tag_list, :venue_details]
 
   # Return a new record with fields selectively copied from the original, and
   # the start_time and end_time adjusted so that their date is set to today and
@@ -633,8 +519,8 @@ EOF
 
   # Is this event old? Default cutoff is yesterday
   def old?(cutoff=nil)
-    cutoff ||= Time.today # midnight today is the end of yesterday
-    return (self.end_time || self.start_time) < cutoff
+    cutoff ||= Time.zone.now.midnight # midnight today is the end of yesterday
+    return (self.end_time || self.start_time + 1.hour) <= cutoff
   end
 
   # Did this event start before today but ends today or later?
@@ -658,7 +544,7 @@ protected
 
   def end_time_later_than_start_time
     if start_time && end_time && end_time < start_time
-      errors.add(:end_time, "End cannot be before start")
+      errors.add(:end_time, "cannot be before start")
     end
   end
 end

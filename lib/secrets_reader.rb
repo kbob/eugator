@@ -1,9 +1,7 @@
 require 'yaml'
 require 'erb'
 require 'ostruct'
-
-require 'rubygems'
-require 'active_support'
+require 'set'
 
 # = SecretsReader
 #
@@ -26,16 +24,18 @@ class SecretsReader
   #
   # Options:
   # * :verbose => Print status to screen on error. Defaults to true.
+  # * :silent => Display nothing, not even errors. Defaults to false.
   def self.read(*args)
-    opts = args.extract_options!
+    given_file = args.first.kind_of?(String) ? args.first : nil
+    opts = args.last.kind_of?(Hash) ? args.last : {}
     verbose = opts[:verbose] != false
-    given_file = args.first
+    silent = opts[:silent] == true
 
     normal_file = "config/secrets.yml"
     sample_file = "config/secrets.yml.sample"
-    rails_root = RAILS_ROOT rescue File.dirname(File.dirname(__FILE__))
+    rails_root = defined?(Rails) ? ::Rails.root : File.dirname(File.dirname(__FILE__))
 
-    message = "** SecretsReader - "
+    message = ""
     error = false
 
     if object = self.filename_to_ostruct(given_file)
@@ -43,20 +43,32 @@ class SecretsReader
     elsif object = self.filename_to_ostruct(File.join(rails_root, normal_file))
       message << "loaded '#{normal_file}'"
     elsif object = self.filename_to_ostruct(File.join(rails_root, sample_file))
-      message << "WARNING! Using insecure '#{sample_file}' settings, see 'Security' in INSTALL.md"
+      message << "WARNING! Using insecure '#{sample_file}' settings, see 'Security' in INSTALL.md" unless defined?($INSECURE_SECRETS)
+      $INSECURE_SECRETS = true
       error = true
     else
       raise Errno::ENOENT, "Couldn't find '#{normal_file}'"
     end
 
-    puts message if error
-    RAILS_DEFAULT_LOGGER.info(message) rescue nil
+    unless silent
+      if message.present?
+        message = "** SecretsReader - #{message}"
+        puts message if error
+        if message.present? && defined?(Rails)
+          Rails.logger.info(message)
+        end
+      end
+    end
 
     return object
   end
 
   # Return an OpenStruct object by reading the +filename+ and parsing it with ERB and YAML.
   def self.filename_to_ostruct(filename)
-    return OpenStruct.new(YAML.load(ERB.new(File.read(filename)).result)) rescue nil
+    if filename.nil? or not File.exist?(filename)
+      return nil
+    else
+      return OpenStruct.new(YAML.load(ERB.new(File.read(filename)).result))
+    end
   end
 end

@@ -1,30 +1,35 @@
 # == Schema Information
-# Schema version: 20080705164959
+# Schema version: 20110604174521
 #
 # Table name: sources
 #
 #  id          :integer         not null, primary key
-#  title       :string(255)     
-#  url         :string(255)     
-#  imported_at :datetime        
-#  created_at  :datetime        
-#  updated_at  :datetime        
-#  reimport    :boolean         
+#  title       :string(255)
+#  url         :string(255)
+#  imported_at :datetime
+#  created_at  :datetime
+#  updated_at  :datetime
+#  reimport    :boolean
 #
 
 # == Source
 #
 # A model that represents a source of events data, such as feeds for hCal, iCal, etc.
 class Source < ActiveRecord::Base
-  Tag # this class uses tagging. referencing the Tag class ensures that has_many_polymorphs initializes correctly across reloads.
-  
-  unless RAILS_ENV == 'test'
-      acts_as_solr
-  end
+  include SearchEngine
+
   validate :assert_url
 
-  has_many :events
-  has_many :updates
+  has_many :events,  :dependent => :destroy
+  has_many :venues,  :dependent => :destroy
+  has_many :updates, :dependent => :destroy
+
+  scope :listing, :order => 'created_at DESC'
+
+  has_paper_trail
+
+  xss_foliate
+  include DecodeHtmlEntitiesHack
 
   # Return a newly-created or existing Source record matching the given
   # attributes. The +attrs+ hash is the same format as used when calling
@@ -109,7 +114,7 @@ class Source < ActiveRecord::Base
     self.imported_at = Time.now
     if valid?
       opts[:url] ||= self.url
-      returning([]) do |events|
+      [].tap do |events|
         SourceParser.to_abstract_events(opts).each do |abstract_event|
           event = Event.from_abstract_event(abstract_event, self)
 

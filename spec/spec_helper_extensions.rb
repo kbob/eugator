@@ -1,9 +1,11 @@
+Venue.perform_geocoding = false
+
 class BeValidXhtml
   # require 'action_controller/test_process'
   # require 'test/unit'
   require 'net/http'
-  require 'md5'
-  require 'ftools'
+  require 'digest/md5'
+  require 'fileutils'
 
   def initialize(options)
     @fragment = options[:fragment]
@@ -34,8 +36,8 @@ class BeValidXhtml
   @@auto_validate = false
   cattr_accessor :auto_validate
 
-  class_inheritable_accessor :auto_validate_excludes
-  class_inheritable_accessor :auto_validate_includes
+  class_attribute :auto_validate_excludes
+  class_attribute :auto_validate_includes
 
 
   def matches?(response)
@@ -103,11 +105,11 @@ class BeValidXhtml
     end
 
     def text_to_multipart(key,value)
-      return "Content-Disposition: form-data; name=\"#{CGI::escape(key)}\"\r\n\r\n#{value}\r\n"
+      return "Content-Disposition: form-data; name=\"#{cgi_escape(key)}\"\r\n\r\n#{value}\r\n"
     end
 
     def file_to_multipart(key,filename,mime_type,content)
-      return "Content-Disposition: form-data; name=\"#{CGI::escape(key)}\"; filename=\"#{filename}\"\r\n" +
+      return "Content-Disposition: form-data; name=\"#{cgi_escape(key)}\"; filename=\"#{filename}\"\r\n" +
                 "Content-Transfer-Encoding: binary\r\nContent-Type: #{mime_type}\r\n\r\n#{content}\r\n"
     end
 
@@ -115,7 +117,7 @@ class BeValidXhtml
       resource_md5 = MD5.md5(resource).to_s
       file_md5 = nil
 
-      output_dir = "#{RAILS_ROOT}/tmp/#{base}"
+      output_dir = "#{Rails.root}/tmp/#{base}"
       base_filename = File.join(output_dir, fn)
       filename = base_filename + extension
 
@@ -152,16 +154,16 @@ def be_valid_xhtml_fragment
 end
 
 # Save the response.body to "/tmp/response.html", to aid manual debugging.
-def save_body
-  filename = "/tmp/response.html"
+def save_body(filename="/tmp/response.html")
   bytes = File.open(filename, "w+"){|h| h.write(response.body)}
+  puts "# Saved response body to: #{filename}"
   return [filename, bytes]
 end
 
 def stub_source_parser_http_response!(opts={})
   code = (opts[:code] || "200").to_s
   body = opts[:body]
-  http_response = mock_model(Net::HTTPResponse, :code => code, :body => body)
+  http_response = double("Net::HTTPResponse", :code => code, :body => body)
   SourceParser::Base.should_receive(:http_response_for).and_return(http_response)
 end
 
@@ -169,4 +171,14 @@ SAMPLES_PATH = File.expand_path(File.dirname(__FILE__) + "/samples") unless defi
 
 def read_sample(path_fragment)
   File.read(File.join(SAMPLES_PATH, path_fragment))
+end
+
+# Returns the time right now.
+def now
+  return Time.zone.now
+end
+
+# Returns the time for today at midnight.
+def today
+  return now.midnight
 end

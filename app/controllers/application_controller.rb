@@ -8,15 +8,6 @@ class ApplicationController < ActionController::Base
   # Uncomment the :secret if you're not using the cookie session store
   protect_from_forgery # :secret => '8813a7fec0bb4fbffd283a3868998eed'
 
-  layout "application"
-
-  # For vendor/plugins/exception_notification
-  if ['preview', 'production'].include?(RAILS_ENV) || ENV['NOTIFY_ON_EXCEPTIONS']
-    include ExceptionNotifiable
-    local_addresses.clear
-    (self.exception_notifiable_silent_exceptions ||= []) << ActionController::InvalidAuthenticityToken if ActionController.const_defined?(:InvalidAuthenticityToken)
-  end
-
   # Setup theme
   layout "application"
   theme THEME_NAME # DEPENDENCY: lib/theme_reader.rb
@@ -38,6 +29,18 @@ protected
   end
   helper_method :link_class
 
+  #---[ Misc ]------------------------------------------------------------
+
+  # Set or append flash +message+ (e.g. "OMG!") to flash key with the name
+  # +kind+ (e.g. :failure).
+  def append_flash(kind, message)
+    kind = kind.to_sym
+    if leaf = flash[kind]
+      flash[kind] = "#{leaf} #{message}"
+    else
+      flash[kind] = "#{message}"
+    end
+  end
 end
 
 # Make it possible to use helpers in controllers
@@ -49,4 +52,9 @@ class Helper
 end
 def help
   Helper.instance
+end
+
+# Return string with contents HTML escaped once.
+def escape_once(*args)
+  help.escape_once(*args)
 end

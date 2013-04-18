@@ -4,23 +4,53 @@ class VenuesController < ApplicationController
   # GET /venues
   # GET /venues.xml
   def index
-    params[:val] ||= ""
-    @tag = params[:tag]
-    if @tag
-      @venues = Venue.tagged_with(@tag)
+    scoped_venues = Venue.non_duplicates
+
+    # Pick a subset of venues (we want in_business by default)
+    if params[:include_closed]
+      scoped_venues = scoped_venues
+    elsif params[:closed]
+      scoped_venues = scoped_venues.out_of_business
     else
-      @venues = Venue.find(:non_duplicates, :conditions => ["title LIKE ?", "%#{params[:val]}%"], :order => 'lower(title)')
+      scoped_venues = scoped_venues.in_business
+    end
+
+    # Support old ajax autocomplete parameter name
+    params[:term] = params[:val] if params[:val]
+
+    @tag = nil
+    if params[:tag].present? # searching by tag
+      @tag = params[:tag]
+      @venues = scoped_venues.tagged_with(@tag)
+    elsif params.has_key?(:query) || params.has_key?(:term) || params[:all] == '1' # searching by query
+      scoped_venues = scoped_venues.with_public_wifi if params[:wifi]
+
+      if params[:term].present? # for the ajax autocomplete widget
+        conditions = ["title LIKE :query", {:query => "%#{params[:term]}%"}]
+      elsif params[:query].present?
+        conditions = ["title LIKE :query OR description LIKE :query", {:query => "%#{params[:query]}%"}]
+      end
+
+      @venues = scoped_venues.order('lower(title)').where(conditions)
+    else # default view
+      @most_active_venues = scoped_venues.limit(10).order('events_count DESC')
+      @newest_venues = scoped_venues.limit(10).order('created_at DESC')
     end
 
     @page_title = "Venues"
 
     respond_to do |format|
       format.html # index.html.erb
-      format.xml  { render :xml => @venues }
-      format.json { render :json => @venues, :callback => params[:callback] }
-      format.js  { render :json => @venues, :callback => params[:callback] }
-      format.kml  # index.kml.erb
+      format.xml  { render :xml  => @venues || scoped_venues }
+      format.json { render :json => @venues || scoped_venues, :callback => params[:callback] }
+      format.js   { render :json => @venues || scoped_venues, :callback => params[:callback] }
+      format.kml  { @venues ||= scoped_venues; render } # index.kml.erb
     end
+  end
+
+  # GET /venues/map
+  def map
+    @venues = Venue.non_duplicates.in_business
   end
 
   # GET /venues/1
@@ -30,16 +60,18 @@ class VenuesController < ApplicationController
       @venue = Venue.find(params[:id], :include => :source)
     rescue ActiveRecord::RecordNotFound => e
       flash[:failure] = e.to_s
-      return redirect_to(:action => :index)
+      return redirect_to(venues_path)
     end
 
     return redirect_to(venue_url(@venue.duplicate_of)) if @venue.duplicate?
 
     @page_title = @venue.title
-    @events = @venue.find_future_events
 
     respond_to do |format|
-      format.html # show.html.erb
+      format.html {
+        @future_events = @venue.events.order("start_time ASC").future.non_duplicates.includes(:venue)
+        @past_events = @venue.events.order("start_time DESC").past.non_duplicates.includes(:venue)
+      }
       format.xml  { render :xml => @venue }
       format.json  { render :json => @venue, :callback => params[:callback] }
     end
@@ -75,7 +107,7 @@ class VenuesController < ApplicationController
     respond_to do |format|
       if !evil_robot && @venue.save
         flash[:success] = 'Venue was successfully created.'
-        format.html { redirect_to(@venue) }
+        format.html { redirect_to( venue_path(@venue) ) }
         format.xml  { render :xml => @venue, :status => :created, :location => @venue }
       else
         format.html { render :action => "new" }
@@ -101,7 +133,7 @@ class VenuesController < ApplicationController
           if(!params[:from_event].blank?)
             redirect_to(event_url(params[:from_event]))
           else
-            redirect_to(@venue)
+            redirect_to( venue_path(@venue) )
           end
           }
         format.xml  { head :ok }
@@ -116,17 +148,30 @@ class VenuesController < ApplicationController
   # DELETE /venues/1.xml
   def destroy
     @venue = Venue.find(params[:id])
-    @venue.destroy
 
-    respond_to do |format|
-      format.html { redirect_to(venues_url) }
-      format.xml  { head :ok }
+    if @venue.events.count > 0
+      message = "Cannot destroy venue that has associated events, you must reassociate all its events first."
+      respond_to do |format|
+        format.html {
+          flash[:failure] = message
+          redirect_to( venue_path(@venue) )
+        }
+        format.xml {
+          render :xml => message, :status => :unprocessable_entity
+        }
+      end
+    else
+      @venue.destroy
+      respond_to do |format|
+        format.html { redirect_to(venues_path, :flash => {:success => "\"#{@venue.title}\" has been deleted"}) }
+        format.xml { head :ok }
+      end
     end
   end
 
   # GET /venues/duplicates
   def duplicates
-    @type = params[:type] || 'title'
+    @type = params[:type]
     begin
       @grouped_venues = Venue.find_duplicates_by_type(@type)
     rescue ArgumentError => e
@@ -140,15 +185,5 @@ class VenuesController < ApplicationController
       format.html # index.html.erb
       format.xml  { render :xml => @grouped_venues }
     end
-  end
-  
-  def refresh_version
-    @venue = \
-      if params[:version] == '-1'
-        Venue.find(params[:id])
-      else
-        Version.find(params[:version]).reify
-      end
-    render :partial => 'form', :locals => { :venue => @venue}
   end
 end

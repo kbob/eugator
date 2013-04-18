@@ -4,10 +4,13 @@ class SourceParser # :nodoc:
   # Reads Upcoming events using their API.
   class Upcoming < Base
     label :Upcoming
+    url_pattern %r{http://(?:m\.)?upcoming.yahoo.com/event/(\d+)}
 
     # Return the Upcoming event_id string extracted from an Upcoming Event URL.
     def self._upcoming_url_to_event_id(url)
-      return url.ergo[%r{http://upcoming.yahoo.com/event/(\d+)}, 1]
+      url.present? ?
+        url[url_pattern, 1] :
+        nil
     end
 
     # Return an Array of AbstractEvent instances extracted from input.
@@ -23,7 +26,7 @@ class SourceParser # :nodoc:
       if opts[:content].nil? or opts[:content] !~ /<rsp stat="ok" version="1.0"/m
         return false unless event_id # Give up unless we can extract the Upcoming event_id.
 
-        api_key = SECRETS.upcoming_api_key # FIXME Extract this API key into instance-specific config file.
+        api_key = SECRETS.upcoming_api_key
         api_url = "http://upcoming.yahooapis.com/services/rest/?api_key=#{api_key}&method=event.getInfo&event_id=#{event_id}"
 
         # Dup and alter `opts` for call to #content_for, without polluting it for other drivers.
@@ -41,10 +44,21 @@ class SourceParser # :nodoc:
       end
 
       event = AbstractEvent.new
-      event.start_time  = Time.parse(leaf['utc_start'])
+
+      # WARNING: Upcoming's "utc_start" and "utc_end" data is invalid and shouldn't be used.
+      event.start_time  = Time.parse("#{leaf['start_date']} #{leaf['start_time']}")
+
+      event.end_time =
+        if leaf['end_date'].blank? && leaf['end_time'].blank?
+          # Both 'end_date' and 'end_time' may be blank if no end was specified.
+          nil
+        else
+          # The "end_date" may be blank if the event ends on the same date as it starts.
+          Time.parse("#{leaf['end_date'].presence || leaf['start_date']} #{leaf['end_time'].presence || leaf['start_time']}")
+        end
+
       event.title       = leaf['name']
       event.description = leaf['description']
-      event.end_time    = Time.parse(leaf['utc_end'])
       event.url         = leaf['url']
       event.tags        = ["upcoming:event=#{event_id}"]
 
@@ -57,6 +71,7 @@ class SourceParser # :nodoc:
       location.country        = leaf['venue_country_name']
       location.latitude       = leaf['latitude']
       location.longitude      = leaf['longitude']
+      location.tags           = ["upcoming:venue=#{leaf['venue_id']}"]
       event.location          = location
 
       return [event]

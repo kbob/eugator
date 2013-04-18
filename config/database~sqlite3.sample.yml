@@ -2,8 +2,8 @@
 #   gem install sqlite3-ruby
 
 common: &common
-  adapter: sqlite3
-  timeout: 5000
+  adapter: <%= defined?(JRUBY_VERSION) ? 'jdbcsqlite3' : 'sqlite3' %>
+  timeout: 15000
 
 development:
   database: db/development.sqlite3

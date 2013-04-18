@@ -10,36 +10,21 @@ class SiteController < ApplicationController
   end
 
   def index
-    @times_to_events_deferred = lambda { Event.select_for_overview }
+    @times_to_events = Event.select_for_overview
+    @tagcloud_items_deferred = lambda { ActsAsTaggableOn::Tag.for_tagcloud }
+
+    respond_to do |format|
+      format.html { } # Default
+      format.any  { redirect_to(events_path(:format => params[:format])) }
+    end
   end
   
   # Displays the about page.
   def about; end
-  
-  def recent_changes
-    events = Event.versioned_class.find(:all, :order => 'updated_at DESC', :limit => 10)
-    venues = Venue.versioned_class.find(:all, :order => 'updated_at DESC', :limit => 10)
-    @items = events.concat(venues).sort { |a,b| b.updated_at <=> a.updated_at  }
-    
-    respond_to do |format|
-      format.html
-      format.atom
-    end
-  end
 
-  # Export the database
-  def export
+  def opensearch
     respond_to do |format|
-      format.html
-      format.sqlite3 do
-        send_file(File.join(RAILS_ROOT, $database_yml_struct.database), :filename => File.basename($database_yml_struct.database))
-      end
-      format.data do
-        require "lib/data_marshal"
-        target = "#{RAILS_ROOT}/tmp/dumps/current.data"
-        DataMarshal.dump_cached(target)
-        send_file(target)
-      end
+      format.xml { render :content_type => 'application/opensearchdescription+xml' }
     end
   end
 end
